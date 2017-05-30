@@ -1,4 +1,4 @@
-Drupal Review Env
+drupal-review-env
 =================
 
 The command line tool to launch cloned Drupal environment for review (code review, test, etc...).
