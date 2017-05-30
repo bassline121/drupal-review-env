@@ -1,0 +1,8 @@
+
+.DS_Store
+
+/.idea
+
+/env/config.sh
+/env/sites
+/env/webroots

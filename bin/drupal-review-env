@@ -1,0 +1,586 @@
+#!/bin/bash
+
+set -eu
+
+CMD=$(basename $0)
+
+usage_exit()
+{
+  cat << USAGE >&2
+Usage: $CMD <command> [args]
+
+Options:
+  -h, --help  Print this help
+
+List existing Drupal sites:
+  \$ $CMD list
+
+Create new Drupal site of branch:
+  \$ $CMD create <branch-name>
+
+Update source files and apply to Drupal:
+  \$ $CMD pull <branch-name|site-id>
+
+Update or create if a site does not exist:
+  \$ $CMD pull --create <branch-name|site-id>
+
+Delete Drupal site:
+  \$ $CMD delete <branch-name|site-id> [-f]
+
+Display information of Drupal site:
+  \$ $CMD info <branch-name|site-id>
+
+Rehash symbolic links of webroot
+  \$ $CMD rehash
+
+Setup MySQL user:
+  \$ $CMD setup-mysql-user | mysql
+USAGE
+  abort
+}
+
+cd "$(dirname $0)"
+
+ENV_ROOT="$(dirname "$(pwd)")/env"
+
+SITES_DIR_NAME='sites'
+WEBROOTS_DIR_NAME='webroots'
+GIT_REMOTE='origin'
+
+SITES_ROOT="$ENV_ROOT/$SITES_DIR_NAME"
+WEBROOTS_ROOT="$ENV_ROOT/$WEBROOTS_DIR_NAME"
+HOOKS_ROOT="$ENV_ROOT/hooks"
+
+# Command name & parameters:
+command=
+parameters=()
+
+# Flags:
+is_force=
+is_json=
+is_create=
+
+# Target site info:
+site_branch_name=
+site_id=
+site_dir=
+site_drupal_root=
+site_base_dump_path=
+site_db=
+site_domains=
+
+dispatch()
+{
+  # Parse command line options.
+  # @see http://qiita.com/b4b4r07/items/dcd6be0bb9c9185475bb
+  for opt in "$@"; do
+    case "$opt" in
+      '-h' | '--help' )
+        usage_exit;;
+      '-f' )
+        is_force=1;;
+      '--json' )
+        is_json=1;;
+      '--create' )
+        is_create=1;;
+      -*)
+        abort "Unknown option: $opt"
+        ;;
+      *)
+        if [[ ! -z "$opt" ]] && [[ ! "$opt" =~ ^-+ ]]; then
+          parameters+=( "$opt" )
+          shift 1
+        fi
+      ;;
+    esac
+  done
+
+  [[ ${#parameters[@]} -eq 0 ]] && usage_exit
+
+  # Set command name
+  command="${parameters[0]}"
+  parameters=( ${parameters[@]:1} )
+
+  # Load config
+  config_path="$ENV_ROOT/config.sh"
+  source "$config_path" 2> /dev/null || abort "Error: cannot load config: $ENV_ROOT/config.sh"
+
+  export base_drupal_root
+  export base_domains
+  export git_url
+  export database_prefix
+  export database_username
+  export database_password
+  export DRUSH
+
+  case "$command" in
+    'help' )
+      usage_exit;;
+    'list' )
+      run_list;;
+    'create' )
+      create_site;;
+    'pull' )
+      pull_site;;
+    'delete' )
+      delete_site;;
+    'info' )
+      show_site_info;;
+    'rehash' )
+      rehash_webroots;;
+    'setup-mysql-user' )
+      gen_sql_setup_mysql_user;;
+    'trigger-hook' )
+      ensure_site_vars
+      trigger_hook ${parameters[@]-}
+      ;;
+
+    '_eval' )
+      ensure_site_vars
+      eval "$(cat - )"
+      ;;
+
+    * )
+      error "Unknown command: $command"
+      exit 1
+      ;;
+  esac
+}
+
+ensure_site_vars()
+{
+  [[ ! -z "$site_id" ]] && return 0
+  [[ ${#parameters[@]} -eq 0 ]] && abort 'Error: missing branch-name or site-id'
+
+  init_site_vars "${parameters[0]}"
+
+  # Drop first param.
+  parameters=( ${parameters[@]:1} )
+}
+
+init_site_vars()
+{
+  export site_branch_name="$1"
+  export site_id="$(site_id_of_branch "$site_branch_name")"
+
+  export site_dir="$SITES_ROOT/$site_id"
+  export site_drupal_root="$site_dir/src"
+  export site_base_dump_path="$site_dir/base/dump.sql"
+
+  export site_db="$(echo "${database_prefix}${site_id}" | sed -e 's/[-\/]/_/g')"
+
+  site_domains=()
+  for base in ${base_domains[@]}; do
+    site_domains+=("$site_id.$base")
+  done
+  export site_domains
+
+  if [[ -f "$site_dir/info/branch_name" ]]; then
+    # Use saved branch name.
+    export site_branch_name="$(cat "$site_dir/info/branch_name")"
+  fi
+}
+
+delete_site()
+{
+  ensure_site_vars
+
+  [[ ! -d "$site_dir" ]] && abort "Error: site does exist: $site_id"
+
+  echo "==> Delete the following Drupal site for '$site_branch_name' branch..."
+  log_site_info | indent '    '
+
+  if [[ -z "$is_force" ]]; then
+   confirm "Delete '$site_branch_name' files & database?" || abort
+  fi
+
+  echo "==> Deleting database '$site_db'..."
+  echo "DROP DATABASE IF EXISTS \`$site_db\`;" | exec_mysql
+
+  echo "==> Deleting directory '$site_dir'..."
+  rm -rf "$site_dir"
+
+  rehash_webroots
+}
+
+show_site_info()
+{
+  ensure_site_vars
+
+  [[ ! -d "$site_dir" ]] && abort "Error: site does not exist: $site_id"
+
+  log_site_info
+}
+
+create_site()
+{
+  ensure_site_vars
+
+  echo "==> Start to create new Drupal site for '$site_branch_name' branch..."
+  log_site_info | indent '    '
+
+  trigger_hook 'pre-create'
+  trigger_hook 'pre-update'
+
+  prepare_create_site
+  dump_site_info
+
+  retrieve_source
+
+  export_base_db
+  create_db
+  import_base_db
+
+  copy_filesystem
+
+  configure_drupal
+  verify_drupal_settings
+
+  rehash_webroots
+
+  trigger_hook 'post-update'
+  trigger_hook 'post-create'
+
+  echo "==> Completed to create the site for '$site_branch_name'!"
+  echo "    You can access via following URLs:"
+  for d in ${site_domains[@]}; do
+    echo "    https://$d"
+  done
+}
+
+pull_site()
+{
+  ensure_site_vars
+
+  if [[ ! -d "$site_dir" ]]; then
+    if [[ -z "$is_create" ]]; then
+      abort "Error: not exists: $site_id"
+     else
+      create_site
+    fi
+  else
+    check_update
+
+    trigger_hook 'pre-pull'
+    trigger_hook 'pre-update'
+
+    update_source
+
+    configure_drupal
+    verify_drupal_settings
+
+    trigger_hook 'post-update'
+    trigger_hook 'post-pull'
+  fi
+}
+
+rehash_webroots()
+{
+  [[ ! -d "$WEBROOTS_ROOT" ]] && mkdir -p "$WEBROOTS_ROOT"
+
+  find "$WEBROOTS_ROOT" -type l | xargs -r rm
+
+  echo "==> Rehashing symlinks in webroots..."
+  pushd "$WEBROOTS_ROOT" > /dev/null
+  for site_id in $(list_sites); do
+    for base in ${base_domains[@]}; do
+      domain="$site_id.$base"
+      ln -sf "../$SITES_DIR_NAME/$site_id" "$domain"
+    done
+  done
+
+  popd > /dev/null
+}
+
+gen_sql_setup_mysql_user()
+{
+  echo "CREATE USER '$database_username'@localhost IDENTIFIED BY '$database_password';"
+  echo "GRANT ALL ON \`$database_prefix%\`.* TO '$database_username'@localhost;"
+}
+
+trigger_hook()
+{
+  [[ $# -eq 0 ]] && abort 'Error: missing hook-name'
+
+  hook="$1"
+  hook_path="$HOOKS_ROOT/$hook"
+
+  if [[ -e "$hook_path" ]]; then
+    echo "==> Executing '$hook' hook..."
+    eval "${hook_path}"
+  fi
+}
+
+# Make branch name be valid as domain.
+site_id_of_branch()
+{
+  echo "$1" | sed -e 's/[^a-z0-9_]/-/ig'
+}
+
+run_list()
+{
+  if [[ -z "$is_json" ]]; then
+    list_sites
+  else
+    echo -n '['
+    comma=''
+    for site_id in $(list_sites); do
+      init_site_vars "$site_id"
+      log_site_info | awk -v ORS= -v comma="$comma" 'BEGIN {print comma} {print "\n" $0}'
+      comma=','
+    done | indent '  '
+    echo ']'
+  fi
+}
+
+list_sites()
+{
+  for site_dir in $(find "$SITES_ROOT" -mindepth 1 -maxdepth 1 -type d); do
+    basename "$site_dir"
+  done | sort
+}
+
+prepare_create_site()
+{
+  if [[ -d "$site_dir" ]]; then
+     # A directory already exists & not empty.
+    [[ "$(ls "$site_dir" | wc -l)" -gt 0 ]] && abort "Error: site already exists: $site_dir"
+  else
+    mkdir -p "$site_dir"
+  fi
+}
+
+dump_site_info()
+{
+  [[ ! -d "$site_dir/info" ]] && mkdir -p "$site_dir/info"
+
+  echo "$site_branch_name" > "$site_dir/info/branch_name"
+  date '+%s' > "$site_dir/info/created"
+}
+
+retrieve_source()
+{
+  echo "==> Retrieving source files from Git..."
+  git clone -b "$site_branch_name" -- "$git_url" "$site_drupal_root"
+}
+
+check_update()
+{
+  echo "==> Checking for updates of Git..."
+
+  pushd "$site_drupal_root" > /dev/null
+
+  git fetch -q "$GIT_REMOTE"
+  log="$(git log --format='format:%h %s (by %an)' HEAD...$GIT_REMOTE/$site_branch_name)"
+
+  popd > /dev/null
+
+  if [[ -z "$log" ]]; then
+    echo 'Already up-to-date' >&2
+    return 1
+  else
+    echo "$log"
+  fi
+}
+
+update_source()
+{
+  echo "==> Updating source files from Git..."
+
+  pushd "$site_drupal_root" > /dev/null
+
+  git reset --hard HEAD
+  git pull "$GIT_REMOTE" "$site_branch_name"
+
+  popd > /dev/null
+}
+
+export_base_db()
+{
+  echo "==> Exporting base Drupal database to $site_base_dump_path..."
+
+  [[ ! -d "$site_dir/base" ]] && mkdir -p "$site_dir/base"
+
+  date '+%s' > "$site_dir/base/created"
+  git --git-dir="$base_drupal_root/.git" rev-parse --abbrev-ref HEAD > "$site_dir/base/branch_name"
+  git --git-dir="$base_drupal_root/.git" rev-parse HEAD > "$site_dir/base/commit"
+
+  $DRUSH -r "$base_drupal_root" sql-dump --result-file="$site_base_dump_path"
+
+  # Remove 'DEFINER' from dump.
+  sed -i 's/^[/][*]!50013 DEFINER=.*//g' "$site_base_dump_path"
+}
+
+create_db()
+{
+  echo "==> Creating database $site_db..."
+  echo "CREATE DATABASE \`$site_db\` DEFAULT CHARACTER SET 'utf8';" | exec_mysql
+}
+
+import_base_db()
+{
+  echo "==> Importing database to $site_db..."
+  cat "$site_base_dump_path" | exec_mysql "$site_db"
+}
+
+copy_filesystem()
+{
+  echo '==> Copying filesystem...'
+
+  [[ ! -d "$site_dir/filesystem" ]] && mkdir -p "$site_dir/filesystem"
+
+  local site_public_dir="$site_drupal_root/sites/default/files"
+  local site_private_dir="$site_dir/filesystem/private"
+
+  if [[ -d "$site_public_dir" ]]; then
+    abort "Error: site public dir already exists: $site_public_dir"
+  elif [[ -d "$site_private_dir" ]] ;then
+    abort "Error: site private dir already exists: $site_private_dir"
+  fi
+
+  base_public_dir="$($DRUSH -r "$base_drupal_root" eval 'echo drupal_realpath("public://");')"
+  echo "    Copy public dir from $base_public_dir"
+  cp -R "$base_public_dir" "$site_public_dir"
+
+  base_private_dir="$($DRUSH -r "$base_drupal_root" eval 'echo drupal_realpath("private://");')"
+  echo "    Copy private dir from $base_private_dir"
+  cp -R "$base_private_dir" "$site_private_dir"
+}
+
+configure_drupal()
+{
+  echo "==> Configuring Drupal..."
+
+  echo -n '    Enable RewriteBase in .htaccess '
+  sed -i 's/^\(\s*\)# \(RewriteBase \/\)$/\1\2/' "$site_drupal_root/.htaccess"
+  echo '[OK]'
+
+  echo -n '    Add settings to sites/default/settings.php '
+
+  if $(grep -q '^/\* BEGIN drupal_review_env_settings \*/$' "$site_drupal_root/sites/default/settings.php"); then
+    echo '[Skipped]'
+  else
+    # Add settings of template '$ENV_ROOT/templates/settings.php'
+    (
+      echo
+      echo '/* BEGIN drupal_review_env_settings */'
+
+      cat "$ENV_ROOT/templates/settings.php" \
+        | sed -e 's/\$/%%%/g' -e 's/{{\(.\+\?\)}}/${\1}/g' \
+        | envsubst \
+        | sed -e 's/%%%/$/g'
+
+      echo '/* END drupal_review_env_settings */'
+      echo
+    ) >> "$site_drupal_root/sites/default/settings.php"
+
+    echo '[OK]'
+  fi
+}
+
+rollback_config()
+{
+  echo '===> Rolling back Drupal configurations...'
+
+  pushd "$site_drupal_root" > /dev/null
+  set -x
+
+  git checkout HEAD -- \
+    "$site_drupal_root/.htaccess" \
+    "$site_drupal_root/sites/default/settings.php"
+
+  set +x
+  popd > /dev/null
+}
+
+verify_drupal_settings()
+{
+  echo "==> Verifying configuration..."
+
+  expected_db_config="host=localhost;dbname=$site_db"
+
+  script='extract(Database::getConnection()->getConnectionOptions()); print "host=$host;dbname=$database";'
+  actual_db_config="$(exec_drush eval "$script") | head -n 1"
+
+  if [[ ${expected_db_config} == ${actual_db_config} ]]; then
+    error "Error: database setting incorrect"
+    error "       expected: $expected_db_config"
+    error "       actual  : $actual_db_config"
+    exit 1
+  fi
+}
+
+exec_mysql()
+{
+  mysql -u${database_username} -p${database_password} "$@"
+}
+
+exec_drush()
+{
+  $DRUSH --root="$site_drupal_root" "$@"
+}
+
+log_site_info()
+{
+  ensure_site_vars
+
+  if [[ -z "$is_json" ]]; then
+    echo "Site ID    : $site_id"
+    echo "Branch Name: $site_branch_name"
+    echo "Drupal Root: $site_drupal_root"
+    echo "Database   : $site_db"
+    echo -n "Domains    : "
+    for d in ${site_domains[@]}; do
+      echo "$d"
+    done | awk 'NR != 1 {printf "             "} {print}'
+  else
+    echo "{"
+    echo "  \"site_id\": \"$site_id\","
+    echo "  \"branch_name\": \"$site_branch_name\","
+    echo "  \"database\": \"$site_db\","
+    echo "  \"domains\": ["
+    for d in ${site_domains[@]}; do
+      echo "\"$d\""
+    done | awk 'NR != 1 {printf ",\n"} {printf "    " "%s", $0}'
+    echo
+    echo "  ]"
+    echo "}"
+  fi
+}
+
+confirm()
+{
+  message="$1 (y/N)"
+
+  while true; do
+    echo -n "$message "
+    read answer
+    case "$answer" in
+      'y'|'yes' )
+        return 0;;
+      '' | 'n' | 'no' )
+        return 1;;
+      * )
+        ;;
+    esac
+  done
+}
+
+indent()
+{
+  awk -v indent="$1" '{print indent $0}'
+}
+
+# @see http://d.hatena.ne.jp/pyopyopyo/20140830/p1
+error()
+{
+  echo "$@" 1>&2
+}
+
+abort()
+{
+  echo "$@" 1>&2
+  exit 1
+}
+
+dispatch "$@"
